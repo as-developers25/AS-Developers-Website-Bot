@@ -7,6 +7,7 @@ import makeWASocket, {
 import pino from "pino";
 import dotenv from "dotenv";
 import cors from "cors";
+import fs from "fs/promises"; // added for auth folder removal
 
 dotenv.config();
 
@@ -259,6 +260,39 @@ Generated With AS Developers AI`;
   } catch (error) {
     console.error("Notify error:", error);
     return res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// --------------- NEW: Disconnect route ---------------
+app.get("/disconnect", async (req, res) => {
+  if (!sock) {
+    return res.json({ success: true, message: "Already disconnected." });
+  }
+
+  try {
+    // Properly logout from WhatsApp
+    await sock.logout();
+    console.log("Logged out successfully.");
+
+    // Remove the auth folder so all session data is wiped
+    await fs.rm("./auth", { recursive: true, force: true });
+    console.log("Auth folder removed.");
+
+    // Clear global state
+    sock = null;
+    pairingCode = null;
+    pairResolve = null;
+
+    return res.json({
+      success: true,
+      message: "Disconnected and auth folder removed. Bot stopped.",
+    });
+  } catch (err) {
+    console.error("Disconnect error:", err);
+    return res.status(500).json({
+      success: false,
+      error: err.message || "Failed to disconnect.",
+    });
   }
 });
 
