@@ -7,7 +7,7 @@ import makeWASocket, {
 import pino from "pino";
 import dotenv from "dotenv";
 import cors from "cors";
-import fs from "fs/promises";   // for auth folder removal
+import fs from "fs/promises";
 
 dotenv.config();
 
@@ -17,7 +17,8 @@ const SERVICES_IMAGE =
   "https://i.postimg.cc/q7mKjByv/Chat-GPT-Image-Jun-14-2026-05-07-32-PM.png";
 
 // --------------- Global state ---------------
-let sock = null;          // current WhatsApp socket
+let sock = null;
+let isBotStarting = false;   // prevents multiple simultaneous starts
 
 // --------------- Express app ---------------
 const app = express();
@@ -70,17 +71,28 @@ app.get("/status", (_req, res) => {
   });
 });
 
-// FIXED PAIRING: requests the code directly on demand
+// --------------- Improved /pair route ---------------
 app.get("/pair", async (req, res) => {
   // If already connected, redirect to status
   if (sock?.user) {
     return res.redirect(302, "/status");
   }
 
+  // If bot is dead (null) or disconnected, restart it automatically
   if (!sock) {
-    return res.status(503).json({ error: "Bot is not initialised yet" });
+    if (isBotStarting) {
+      return res.status(503).json({ error: "Bot restart in progress, please wait a moment..." });
+    }
+    try {
+      console.log("⚡ Bot is dead. Starting new session...");
+      await startBot();
+    } catch (err) {
+      console.error("Failed to start bot:", err);
+      return res.status(500).json({ error: "Could not start bot. Check logs." });
+    }
   }
 
+  // Now sock definitely exists, request pairing code
   try {
     console.log("📲 Requesting pairing code...");
     const code = await sock.requestPairingCode(PHONE_NUMBER);
@@ -92,27 +104,23 @@ app.get("/pair", async (req, res) => {
   }
 });
 
-// NEW: Disconnect route – logs out and deletes auth folder
+// --------------- Disconnect route ---------------
 app.get("/disconnect", async (req, res) => {
   if (!sock) {
     return res.json({ success: true, message: "Already disconnected." });
   }
 
   try {
-    // Logout from WhatsApp
     await sock.logout();
     console.log("Logged out successfully.");
 
-    // Delete auth folder
     await fs.rm("./auth", { recursive: true, force: true });
     console.log("Auth folder removed.");
 
-    // Reset global socket
-    sock = null;
-
+    sock = null;   // completely dead now
     return res.json({
       success: true,
-      message: "Disconnected and auth folder deleted. Bot stopped.",
+      message: "Disconnected & auth folder deleted. Bot stopped. Use /pair to start fresh.",
     });
   } catch (err) {
     console.error("Disconnect error:", err);
@@ -123,7 +131,7 @@ app.get("/disconnect", async (req, res) => {
   }
 });
 
-// Notify endpoint – kept for your website forms (not lead detection)
+// --------------- Notify (unchanged) ---------------
 app.post("/notify", async (req, res) => {
   try {
     const { type, data } = req.body;
@@ -189,68 +197,78 @@ app.post("/notify", async (req, res) => {
   }
 });
 
-// --------------- WhatsApp socket (auto‑reconnect) ---------------
+// --------------- WhatsApp socket (reconnectable) ---------------
 async function startBot() {
-  const { state, saveCreds } = await useMultiFileAuthState("./auth");
-  const { version } = await fetchLatestBaileysVersion();
+  // Prevent overlapping starts
+  if (isBotStarting) return;
+  isBotStarting = true;
 
-  sock = makeWASocket({
-    version,
-    auth: state,
-    logger: pino({ level: "silent" }),
-    printQRInTerminal: false,
-  });
+  try {
+    const { state, saveCreds } = await useMultiFileAuthState("./auth");
+    const { version } = await fetchLatestBaileysVersion();
 
-  sock.ev.on("creds.update", saveCreds);
+    sock = makeWASocket({
+      version,
+      auth: state,
+      logger: pino({ level: "silent" }),
+      printQRInTerminal: false,
+    });
 
-  sock.ev.on("connection.update", async (update) => {
-    const { connection, lastDisconnect } = update;
-    console.log("Connection status:", connection);
+    sock.ev.on("creds.update", saveCreds);
 
-    if (connection === "open") {
-      console.log("✅ Bot Connected");
-      await sendWaMessage(
-        `${PHONE_NUMBER}@s.whatsapp.net`,
-        "Bot Successfully Connected ✅"
-      );
-    }
+    sock.ev.on("connection.update", async (update) => {
+      const { connection, lastDisconnect } = update;
+      console.log("Connection status:", connection);
 
-    if (connection === "close") {
-      const statusCode = lastDisconnect?.error?.output?.statusCode;
-      console.log("❌ Disconnected:", statusCode);
-      if (statusCode !== DisconnectReason.loggedOut) {
-        // Reconnect after 5 seconds
-        setTimeout(startBot, 5000);
+      if (connection === "open") {
+        console.log("✅ Bot Connected");
+        await sendWaMessage(
+          `${PHONE_NUMBER}@s.whatsapp.net`,
+          "Bot Successfully Connected ✅"
+        );
       }
-    }
-  });
 
-  // Incoming messages – only the "services" command, no leads or appointments
-  sock.ev.on("messages.upsert", async ({ messages }) => {
-    const msg = messages[0];
-    if (!msg.message) return;
+      if (connection === "close") {
+        const statusCode = lastDisconnect?.error?.output?.statusCode;
+        console.log("❌ Disconnected:", statusCode);
+        // Reconnect only if not logged out (and not a manual disconnect)
+        if (statusCode !== DisconnectReason.loggedOut) {
+          sock = null; // socket dead
+          setTimeout(() => {
+            startBot().catch(console.error);
+          }, 5000);
+        } else {
+          // Logged out manually – don't auto-restart
+          sock = null;
+        }
+      }
+    });
 
-    const from = msg.key.remoteJid;
-    if (from === "status@broadcast") return;
-    if (from.endsWith("@g.us")) return;
-    if (msg.key.fromMe) return;
-    if (from === `${OWNER_NUMBER}@s.whatsapp.net`) return;
+    // Incoming messages – only the "services" command
+    sock.ev.on("messages.upsert", async ({ messages }) => {
+      const msg = messages[0];
+      if (!msg.message) return;
 
-    const text =
-      msg.message.conversation ||
-      msg.message.extendedTextMessage?.text ||
-      "";
-    if (!text) return;
+      const from = msg.key.remoteJid;
+      if (from === "status@broadcast") return;
+      if (from.endsWith("@g.us")) return;
+      if (msg.key.fromMe) return;
+      if (from === `${OWNER_NUMBER}@s.whatsapp.net`) return;
 
-    console.log("Message:", text);
+      const text =
+        msg.message.conversation ||
+        msg.message.extendedTextMessage?.text ||
+        "";
+      if (!text) return;
 
-    const lower = text.toLowerCase();
+      console.log("Message:", text);
 
-    // Only reply to "services" command
-    if (lower === "services") {
-      await sock.sendMessage(from, {
-        image: { url: SERVICES_IMAGE },
-        caption: `*AS Developers Services*
+      const lower = text.toLowerCase();
+
+      if (lower === "services") {
+        await sock.sendMessage(from, {
+          image: { url: SERVICES_IMAGE },
+          caption: `*AS Developers Services*
 
 • Custom Web Applications
 • Mobile Apps
@@ -266,15 +284,22 @@ Website:
 https://www.as-developers.com
 
 Generated With AS Developers AI`,
-      });
-    }
-  });
+        });
+      }
+    });
+
+    console.log("✅ Bot instance created and ready for pairing.");
+  } catch (err) {
+    console.error("startBot error:", err);
+  } finally {
+    isBotStarting = false;
+  }
 }
 
 // --------------- Start server ---------------
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`API server running on port ${PORT}`);
+  // initial bot start
+  startBot().catch((err) => console.error("Initial start failed:", err));
 });
-
-startBot().catch((err) => console.error("Fatal error:", err));
