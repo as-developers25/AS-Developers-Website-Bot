@@ -443,3 +443,4 @@ app.listen(PORT, () => {
 });
 
 startBot().catch((err) => console.error("Fatal error:", err));
+
